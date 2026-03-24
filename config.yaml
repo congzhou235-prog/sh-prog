@@ -40,6 +40,10 @@ wavefront_grid:
   array_dtype: float32
   storage_order: row_major
 
+wavefront_random:
+  n_modes: 5
+  coeff_std_waves: 1.0
+
 cmos:
   active_area_m: [1.0e-2, 1.0e-2]
   match_microlens_area: true
@@ -58,6 +62,7 @@ detection:
   method: centroid
   threshold_relative: 0.2
   background_subtraction: true
+  min_lenslet_fill: 0.6
 
 reconstruction:
   algorithm: zernike_least_squares
