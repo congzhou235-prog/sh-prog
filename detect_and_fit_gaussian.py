@@ -1,11 +1,11 @@
 """
-Detect lenslet spot shifts and fit Zernike coefficients from a simulated
-Shack-Hartmann image.
+Detect lenslet spot shifts and fit Zernike coefficients using
+2D Gaussian centroid fitting on each lenslet spot.
 
 Pipeline:
 1) Generate random wavefront (ground truth coefficients a_n).
 2) Simulate SH image using per-lenslet FFT model.
-3) Detect lenslet centroids.
+3) Detect lenslet centroids by subpixel 2D Gaussian fitting.
 4) Build sensitivity matrix by per-mode calibration simulation.
 5) Solve least squares to estimate coefficients and compare to ground truth.
 """
@@ -19,8 +19,10 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.optimize import least_squares
 
 import simulate_wavefront_and_sh_image as sim
+
 
 
 def lenslet_grid_info(cfg: Dict) -> Tuple[int, int, int]:
@@ -39,6 +41,7 @@ def lenslet_grid_info(cfg: Dict) -> Tuple[int, int, int]:
     return s, lx, ly
 
 
+
 def compute_fill_map(pupil_mask: np.ndarray, s: int, lx: int, ly: int) -> np.ndarray:
     fill = np.zeros((ly, lx), dtype=np.float64)
     for j in range(ly):
@@ -51,16 +54,110 @@ def compute_fill_map(pupil_mask: np.ndarray, s: int, lx: int, ly: int) -> np.nda
     return fill
 
 
-def _quadratic_subpixel_offset(v_m1: float, v_0: float, v_p1: float) -> float:
+
+def _fit_gaussian_centroid(
+    patch: np.ndarray,
+    gx_local: np.ndarray,
+    gy_local: np.ndarray,
+    fit_threshold_relative: float,
+    max_nfev: int,
+    sigma_min_px: float,
+    sigma_max_px: float,
+) -> Tuple[float, float, bool]:
     """
-    3-point quadratic interpolation offset in [-1, 1].
+    Fit a separable 2D Gaussian with constant background:
+    I(x,y) = b + a * exp(-0.5 * [((x-x0)/sx)^2 + ((y-y0)/sy)^2])
+
+    Returns (x0, y0, success).
     """
 
-    denom = (v_m1 - 2.0 * v_0 + v_p1)
-    if abs(denom) < 1e-12:
-        return 0.0
-    offset = 0.5 * (v_m1 - v_p1) / denom
-    return float(np.clip(offset, -1.0, 1.0))
+    s_y, s_x = patch.shape
+    if s_x != s_y:
+        return 0.0, 0.0, False
+
+    peak = float(np.max(patch))
+    if peak <= 1e-12:
+        return 0.0, 0.0, False
+
+    if fit_threshold_relative > 0.0:
+        fit_mask = patch >= (fit_threshold_relative * peak)
+    else:
+        fit_mask = np.ones_like(patch, dtype=bool)
+
+    if int(np.count_nonzero(fit_mask)) < 9:
+        fit_mask = patch > 0.0
+    if int(np.count_nonzero(fit_mask)) < 9:
+        return 0.0, 0.0, False
+
+    w = np.where(fit_mask, patch, 0.0)
+    w_sum = float(np.sum(w))
+    if w_sum <= 1e-12:
+        return 0.0, 0.0, False
+
+    x0_init = float(np.sum(w * gx_local) / w_sum)
+    y0_init = float(np.sum(w * gy_local) / w_sum)
+
+    sx_init = float(np.sqrt(np.sum(w * (gx_local - x0_init) ** 2) / w_sum + 1e-12))
+    sy_init = float(np.sqrt(np.sum(w * (gy_local - y0_init) ** 2) / w_sum + 1e-12))
+
+    sx_init = float(np.clip(sx_init, sigma_min_px, sigma_max_px))
+    sy_init = float(np.clip(sy_init, sigma_min_px, sigma_max_px))
+
+    b_init = float(np.percentile(patch, 10))
+    b_init = max(0.0, min(b_init, peak))
+    a_init = max(peak - b_init, 1e-9)
+
+    x_data = gx_local[fit_mask].astype(np.float64)
+    y_data = gy_local[fit_mask].astype(np.float64)
+    z_data = patch[fit_mask].astype(np.float64)
+
+    p0 = np.array([b_init, a_init, x0_init, y0_init, sx_init, sy_init], dtype=np.float64)
+
+    low = np.array([0.0, 0.0, 0.0, 0.0, sigma_min_px, sigma_min_px], dtype=np.float64)
+    high = np.array(
+        [
+            max(peak * 2.0, 1e-9),
+            max(peak * 10.0, 1e-9),
+            float(s_x - 1),
+            float(s_y - 1),
+            sigma_max_px,
+            sigma_max_px,
+        ],
+        dtype=np.float64,
+    )
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        b, a, x0, y0, sx, sy = params
+        sx = max(float(sx), 1e-9)
+        sy = max(float(sy), 1e-9)
+        model = b + a * np.exp(
+            -0.5 * (((x_data - x0) / sx) ** 2 + ((y_data - y0) / sy) ** 2)
+        )
+        return model - z_data
+
+    try:
+        result = least_squares(
+            residuals,
+            x0=p0,
+            bounds=(low, high),
+            method="trf",
+            max_nfev=max_nfev,
+        )
+    except Exception:
+        return 0.0, 0.0, False
+
+    if not np.all(np.isfinite(result.x)):
+        return 0.0, 0.0, False
+
+    x_fit = float(result.x[2])
+    y_fit = float(result.x[3])
+    if not (0.0 <= x_fit <= (s_x - 1) and 0.0 <= y_fit <= (s_y - 1)):
+        return 0.0, 0.0, False
+
+    # Accept near-converged solutions too; "status > 0" is strict,
+    # while low-res patches may terminate on max_nfev with a good center.
+    return x_fit, y_fit, True
+
 
 
 def detect_lenslet_centroids(
@@ -68,17 +165,19 @@ def detect_lenslet_centroids(
     s: int,
     lx: int,
     ly: int,
-    threshold_relative: float,
+    pre_threshold_relative: float,
     background_subtraction: bool,
-    method: str = "threshold_centroid",
-    window_radius_px: int = 6,
-    peak_refine: bool = True,
-    gaussian_window_sigma_px: float = 3.0,
-) -> Tuple[np.ndarray, np.ndarray]:
+    gaussian_fit_threshold_relative: float,
+    gaussian_fit_max_nfev: int,
+    gaussian_fit_sigma_min_px: float,
+    gaussian_fit_sigma_max_px: float,
+    gaussian_fit_fallback_centroid: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Return:
     - centroids_local: shape (ly, lx, 2), local cell coordinates in pixels
     - valid: shape (ly, lx), whether centroid was detected
+    - fitted_by_gaussian: shape (ly, lx), whether Gaussian fitting succeeded
     """
 
     gx_local, gy_local = np.meshgrid(
@@ -87,6 +186,7 @@ def detect_lenslet_centroids(
 
     centroids = np.full((ly, lx, 2), np.nan, dtype=np.float64)
     valid = np.zeros((ly, lx), dtype=bool)
+    fitted_by_gaussian = np.zeros((ly, lx), dtype=bool)
 
     for j in range(ly):
         y0 = j * s
@@ -102,66 +202,39 @@ def detect_lenslet_centroids(
 
             patch = np.clip(patch, a_min=0.0, a_max=None)
 
-            if threshold_relative > 0:
-                threshold = threshold_relative * float(np.max(patch))
+            if pre_threshold_relative > 0.0:
+                threshold = pre_threshold_relative * float(np.max(patch))
                 patch = np.where(patch >= threshold, patch, 0.0)
 
-            if method == "threshold_centroid":
-                weight_sum = float(np.sum(patch))
-                if weight_sum <= 1e-12:
-                    continue
-                cx = float(np.sum(patch * gx_local) / weight_sum)
-                cy = float(np.sum(patch * gy_local) / weight_sum)
+            cx, cy, ok = _fit_gaussian_centroid(
+                patch=patch,
+                gx_local=gx_local,
+                gy_local=gy_local,
+                fit_threshold_relative=gaussian_fit_threshold_relative,
+                max_nfev=gaussian_fit_max_nfev,
+                sigma_min_px=gaussian_fit_sigma_min_px,
+                sigma_max_px=gaussian_fit_sigma_max_px,
+            )
 
-            elif method == "windowed_peak_centroid":
-                if float(np.max(patch)) <= 0.0:
-                    continue
+            gaussian_ok = bool(ok)
 
-                y_peak_i, x_peak_i = np.unravel_index(np.argmax(patch), patch.shape)
-                x_peak = float(x_peak_i)
-                y_peak = float(y_peak_i)
+            if not ok and gaussian_fit_fallback_centroid:
+                w_sum = float(np.sum(patch))
+                if w_sum > 1e-12:
+                    cx = float(np.sum(patch * gx_local) / w_sum)
+                    cy = float(np.sum(patch * gy_local) / w_sum)
+                    ok = True
 
-                if peak_refine:
-                    if 1 <= x_peak_i < s - 1:
-                        x_peak += _quadratic_subpixel_offset(
-                            float(patch[y_peak_i, x_peak_i - 1]),
-                            float(patch[y_peak_i, x_peak_i]),
-                            float(patch[y_peak_i, x_peak_i + 1]),
-                        )
-                    if 1 <= y_peak_i < s - 1:
-                        y_peak += _quadratic_subpixel_offset(
-                            float(patch[y_peak_i - 1, x_peak_i]),
-                            float(patch[y_peak_i, x_peak_i]),
-                            float(patch[y_peak_i + 1, x_peak_i]),
-                        )
-
-                rr2 = (gx_local - x_peak) ** 2 + (gy_local - y_peak) ** 2
-                window_mask = rr2 <= float(window_radius_px**2)
-
-                if gaussian_window_sigma_px > 0:
-                    gw = np.exp(-rr2 / (2.0 * gaussian_window_sigma_px**2))
-                else:
-                    gw = np.ones_like(patch)
-
-                weights = patch * window_mask * gw
-                weight_sum = float(np.sum(weights))
-                if weight_sum <= 1e-12:
-                    continue
-
-                cx = float(np.sum(weights * gx_local) / weight_sum)
-                cy = float(np.sum(weights * gy_local) / weight_sum)
-
-            else:
-                raise ValueError(
-                    'Unknown centroid method. Use "threshold_centroid" '
-                    'or "windowed_peak_centroid".'
-                )
+            if not ok:
+                continue
 
             centroids[j, i, 0] = cx
             centroids[j, i, 1] = cy
             valid[j, i] = True
+            fitted_by_gaussian[j, i] = bool(gaussian_ok)
 
-    return centroids, valid
+    return centroids, valid, fitted_by_gaussian
+
 
 
 def build_mode_maps(cfg: Dict, n_modes: int) -> Tuple[List[np.ndarray], np.ndarray]:
@@ -195,23 +268,24 @@ def build_mode_maps(cfg: Dict, n_modes: int) -> Tuple[List[np.ndarray], np.ndarr
     return modes, pupil_mask
 
 
+
 def build_sensitivity_matrix(
     cfg: Dict,
     mode_maps: List[np.ndarray],
     pupil_mask: np.ndarray,
     centroids_ref: np.ndarray,
-    valid_ref: np.ndarray,
     valid_base: np.ndarray,
     calib_delta_m: float,
     s: int,
     lx: int,
     ly: int,
-    threshold_relative: float,
+    pre_threshold_relative: float,
     background_subtraction: bool,
-    centroid_method: str,
-    centroid_window_radius_px: int,
-    centroid_peak_refine: bool,
-    centroid_gaussian_window_sigma_px: float,
+    gaussian_fit_threshold_relative: float,
+    gaussian_fit_max_nfev: int,
+    gaussian_fit_sigma_min_px: float,
+    gaussian_fit_sigma_max_px: float,
+    gaussian_fit_fallback_centroid: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
@@ -227,17 +301,18 @@ def build_sensitivity_matrix(
         opd_mode = calib_delta_m * mode
         image_mode, _ = sim.simulate_sh_image(cfg, opd_mode, pupil_mask)
 
-        cent_mode, valid_mode = detect_lenslet_centroids(
+        cent_mode, valid_mode, _ = detect_lenslet_centroids(
             image=image_mode,
             s=s,
             lx=lx,
             ly=ly,
-            threshold_relative=threshold_relative,
+            pre_threshold_relative=pre_threshold_relative,
             background_subtraction=background_subtraction,
-            method=centroid_method,
-            window_radius_px=centroid_window_radius_px,
-            peak_refine=centroid_peak_refine,
-            gaussian_window_sigma_px=centroid_gaussian_window_sigma_px,
+            gaussian_fit_threshold_relative=gaussian_fit_threshold_relative,
+            gaussian_fit_max_nfev=gaussian_fit_max_nfev,
+            gaussian_fit_sigma_min_px=gaussian_fit_sigma_min_px,
+            gaussian_fit_sigma_max_px=gaussian_fit_sigma_max_px,
+            gaussian_fit_fallback_centroid=gaussian_fit_fallback_centroid,
         )
 
         shift_mode = cent_mode - centroids_ref
@@ -261,6 +336,7 @@ def build_sensitivity_matrix(
         A[:, idx] = col / calib_delta_m
 
     return A, final_valid
+
 
 
 def plot_fit_summary(
@@ -305,6 +381,7 @@ def plot_fit_summary(
     plt.show()
 
 
+
 def make_run_dir(output_root: Path, prefix: str) -> Path:
     output_root = output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -318,6 +395,7 @@ def make_run_dir(output_root: Path, prefix: str) -> Path:
 
     run_dir.mkdir(parents=False, exist_ok=False)
     return run_dir
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -349,7 +427,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-prefix",
         type=str,
-        default="detect_fit",
+        default="detect_fit_gaussian",
         help="Prefix for each run folder.",
     )
     parser.add_argument(
@@ -371,6 +449,7 @@ def parse_args() -> argparse.Namespace:
         help="Output CSV filename inside the run folder.",
     )
     return parser.parse_args()
+
 
 
 def main() -> None:
@@ -399,44 +478,50 @@ def main() -> None:
     s, lx, ly = lenslet_grid_info(cfg)
 
     det = cfg.get("detection", {})
-    threshold_relative = float(det.get("threshold_relative", 0.0))
     background_subtraction = bool(det.get("background_subtraction", True))
     min_lenslet_fill = float(det.get("min_lenslet_fill", 0.6))
-    centroid_method = str(det.get("method", "threshold_centroid"))
-    if centroid_method == "centroid":
-        centroid_method = "threshold_centroid"
-    centroid_window_radius_px = int(det.get("centroid_window_radius_px", 6))
-    centroid_peak_refine = bool(det.get("centroid_peak_refine", True))
-    centroid_gaussian_window_sigma_px = float(
-        det.get("centroid_gaussian_window_sigma_px", 3.0)
+
+    pre_threshold_relative = float(det.get("gaussian_prethreshold_relative", 0.0))
+    gaussian_fit_threshold_relative = float(
+        det.get("gaussian_fit_threshold_relative", 0.2)
+    )
+    gaussian_fit_max_nfev = int(det.get("gaussian_fit_max_nfev", 80))
+    gaussian_fit_sigma_min_px = float(det.get("gaussian_fit_sigma_min_px", 0.8))
+    gaussian_fit_sigma_max_px = float(
+        det.get("gaussian_fit_sigma_max_px", max(2.0, s / 2.0))
+    )
+    gaussian_fit_fallback_centroid = bool(
+        det.get("gaussian_fit_fallback_centroid", True)
     )
 
     fill_map = compute_fill_map(pupil_mask, s=s, lx=lx, ly=ly)
     valid_fill = fill_map > max(min_lenslet_fill, 1e-6)
 
-    cent_ref, valid_ref = detect_lenslet_centroids(
+    cent_ref, valid_ref, gauss_ref = detect_lenslet_centroids(
         image=ref_image,
         s=s,
         lx=lx,
         ly=ly,
-        threshold_relative=threshold_relative,
+        pre_threshold_relative=pre_threshold_relative,
         background_subtraction=background_subtraction,
-        method=centroid_method,
-        window_radius_px=centroid_window_radius_px,
-        peak_refine=centroid_peak_refine,
-        gaussian_window_sigma_px=centroid_gaussian_window_sigma_px,
+        gaussian_fit_threshold_relative=gaussian_fit_threshold_relative,
+        gaussian_fit_max_nfev=gaussian_fit_max_nfev,
+        gaussian_fit_sigma_min_px=gaussian_fit_sigma_min_px,
+        gaussian_fit_sigma_max_px=gaussian_fit_sigma_max_px,
+        gaussian_fit_fallback_centroid=gaussian_fit_fallback_centroid,
     )
-    cent_meas, valid_meas = detect_lenslet_centroids(
+    cent_meas, valid_meas, gauss_meas = detect_lenslet_centroids(
         image=sh_image,
         s=s,
         lx=lx,
         ly=ly,
-        threshold_relative=threshold_relative,
+        pre_threshold_relative=pre_threshold_relative,
         background_subtraction=background_subtraction,
-        method=centroid_method,
-        window_radius_px=centroid_window_radius_px,
-        peak_refine=centroid_peak_refine,
-        gaussian_window_sigma_px=centroid_gaussian_window_sigma_px,
+        gaussian_fit_threshold_relative=gaussian_fit_threshold_relative,
+        gaussian_fit_max_nfev=gaussian_fit_max_nfev,
+        gaussian_fit_sigma_min_px=gaussian_fit_sigma_min_px,
+        gaussian_fit_sigma_max_px=gaussian_fit_sigma_max_px,
+        gaussian_fit_fallback_centroid=gaussian_fit_fallback_centroid,
     )
 
     valid_base = valid_fill & valid_ref & valid_meas
@@ -450,18 +535,18 @@ def main() -> None:
         mode_maps=mode_maps,
         pupil_mask=pupil_mask,
         centroids_ref=cent_ref,
-        valid_ref=valid_ref,
         valid_base=valid_base,
         calib_delta_m=float(args.calib_delta_m),
         s=s,
         lx=lx,
         ly=ly,
-        threshold_relative=threshold_relative,
+        pre_threshold_relative=pre_threshold_relative,
         background_subtraction=background_subtraction,
-        centroid_method=centroid_method,
-        centroid_window_radius_px=centroid_window_radius_px,
-        centroid_peak_refine=centroid_peak_refine,
-        centroid_gaussian_window_sigma_px=centroid_gaussian_window_sigma_px,
+        gaussian_fit_threshold_relative=gaussian_fit_threshold_relative,
+        gaussian_fit_max_nfev=gaussian_fit_max_nfev,
+        gaussian_fit_sigma_min_px=gaussian_fit_sigma_min_px,
+        gaussian_fit_sigma_max_px=gaussian_fit_sigma_max_px,
+        gaussian_fit_fallback_centroid=gaussian_fit_fallback_centroid,
     )
 
     shifts_meas = cent_meas - cent_ref
@@ -474,12 +559,29 @@ def main() -> None:
     residual_px = b - A @ est_coeff_m
     rmse_px = float(np.sqrt(np.mean(residual_px**2)))
 
+    coeff_rmse_m = float(np.sqrt(np.mean((est_coeff_m - true_coeff_m) ** 2)))
+
     print("=== Detection + Fitting Summary ===")
     print(f"Model: {sh_meta.get('model', 'unknown')}")
-    print(f"Centroid method: {centroid_method}")
+    print("Centroid method: gaussian_2d_fit")
     print(f"Number of fitted modes: {n_modes}")
     print(f"Valid lenslets used: {int(np.sum(valid_final))}")
     print(f"Residual RMSE (px): {rmse_px:.6f}")
+    print(f"Coefficient RMSE (m): {coeff_rmse_m:.6e}")
+
+    ref_valid_count = int(np.sum(valid_ref))
+    meas_valid_count = int(np.sum(valid_meas))
+    if ref_valid_count > 0:
+        print(
+            "Gaussian fit usage (ref): "
+            f"{int(np.sum(gauss_ref & valid_ref))}/{ref_valid_count}"
+        )
+    if meas_valid_count > 0:
+        print(
+            "Gaussian fit usage (meas): "
+            f"{int(np.sum(gauss_meas & valid_meas))}/{meas_valid_count}"
+        )
+
     print("")
     print("j | true_a_n (m) | fitted_a_n (m) | error (m)")
     for j in range(1, n_modes + 1):
@@ -500,6 +602,7 @@ def main() -> None:
         b=b,
     )
     print(f"Saved results: {out_npz}")
+
     with out_csv.open("w", encoding="utf-8") as f:
         f.write("j,true_a_n_m,fitted_a_n_m,error_m\n")
         for j in range(1, n_modes + 1):
@@ -520,4 +623,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

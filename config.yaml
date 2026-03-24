@@ -66,6 +66,12 @@ detection:
   centroid_window_radius_px: 6
   centroid_peak_refine: true
   centroid_gaussian_window_sigma_px: 3.0
+  gaussian_prethreshold_relative: 0.0
+  gaussian_fit_threshold_relative: 0.2
+  gaussian_fit_max_nfev: 80
+  gaussian_fit_sigma_min_px: 0.8
+  gaussian_fit_sigma_max_px: 16.0
+  gaussian_fit_fallback_centroid: true
 
 reconstruction:
   algorithm: zernike_least_squares
