@@ -69,7 +69,7 @@ def zernike_mode(j: int, rho: np.ndarray, phi: np.ndarray) -> np.ndarray:
 
     return norm * r * angular
 
-
+# 随机生成波前相位
 def build_wavefront_phase(
     cfg: Dict,
     coeff_scale: float = 1.0,
@@ -90,13 +90,15 @@ def build_wavefront_phase(
 
     used_w = float(mla["computed"]["used_area_m"][0])
     used_h = float(mla["computed"]["used_area_m"][1])
-
+    
+    #网络一致性检验
     if abs(nx * dx - used_w) > 1e-12 or abs(ny * dy - used_h) > 1e-12:
         raise ValueError(
             "Grid shape/spacing is inconsistent with used microlens area. "
             "Please keep nx*dx and ny*dy equal to used_area_m."
         )
-
+    
+    #构建坐标网络，中心对齐
     x = (np.arange(nx) - nx / 2 + 0.5) * dx
     y = (np.arange(ny) - ny / 2 + 0.5) * dy
     xx, yy = np.meshgrid(x, y)

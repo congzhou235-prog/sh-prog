@@ -29,13 +29,13 @@ microlens_array:
 
 wavefront_grid:
   domain: used_microlens_area
-  nx: 1056
-  ny: 1056
-  samples_per_lenslet: 32
-  dx_m: 9.375e-6
-  dy_m: 9.375e-6
-  points_per_lenslet: 32
-  density_points_per_mm: 106.6666666667
+  nx: 2112
+  ny: 2112
+  samples_per_lenslet: 64
+  dx_m: 4.6875e-6
+  dy_m: 4.6875e-6
+  points_per_lenslet: 64
+  density_points_per_mm: 213.3333333333
   phase_representation: phase_rad
   array_dtype: float32
   storage_order: row_major
@@ -55,7 +55,7 @@ cmos:
 propagation:
   method: fresnel
   distance_lenslet_to_cmos_m: null
-  grid_size: 1056
+  grid_size: 2112
   oversampling: 2
 
 detection:
