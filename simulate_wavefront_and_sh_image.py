@@ -15,6 +15,7 @@ All physical sizes are interpreted in meters.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from math import comb, sqrt
 from pathlib import Path
 from typing import Dict, Tuple
@@ -288,6 +289,21 @@ def plot_results(
     plt.show()
 
 
+def make_run_dir(output_root: Path, prefix: str) -> Path:
+    output_root = output_root.resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = output_root / f"{prefix}_{stamp}"
+    suffix = 1
+    while run_dir.exists():
+        run_dir = output_root / f"{prefix}_{stamp}_{suffix:02d}"
+        suffix += 1
+
+    run_dir.mkdir(parents=False, exist_ok=False)
+    return run_dir
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -297,10 +313,22 @@ def parse_args() -> argparse.Namespace:
         help="Path to config YAML (default: config.yaml in current directory).",
     )
     parser.add_argument(
+        "--output-root",
+        type=str,
+        default="runs",
+        help="Directory where each run gets a timestamped output folder.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="wavefront_and_sh_image.png",
-        help="Output figure filename.",
+        help="Output figure filename inside the run folder.",
+    )
+    parser.add_argument(
+        "--output-npz",
+        type=str,
+        default="sim_results.npz",
+        help="Output npz filename inside the run folder.",
     )
     parser.add_argument(
         "--coeff-scale",
@@ -314,7 +342,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg_path = Path(args.config).resolve()
-    out_path = Path(args.output).resolve()
+    run_dir = make_run_dir(Path(args.output_root), prefix="simulate")
+    out_path = run_dir / Path(args.output).name
+    out_npz = run_dir / Path(args.output_npz).name
 
     cfg = load_config(cfg_path)
 
@@ -324,10 +354,21 @@ def main() -> None:
     )
     sh_image, spot_meta = simulate_sh_image(cfg, opd_m=opd_m, pupil_mask=pupil_mask)
 
+    print(f"Run directory: {run_dir}")
     print(f"Zernike coeff scale: {float(args.coeff_scale):.3f}")
     print(f"Model: {spot_meta['model']}")
     print(f"Mean spot shift: {spot_meta['mean_shift_px']:.3f} px")
     print(f"Max spot shift: {spot_meta['max_shift_px']:.3f} px")
+
+    np.savez_compressed(
+        out_npz,
+        phase_rad=phase_rad,
+        opd_m=opd_m,
+        pupil_mask=pupil_mask,
+        sh_image=sh_image,
+        coeff_map=coeff_map,
+    )
+    print(f"Saved results: {out_npz}")
 
     plot_results(
         cfg=cfg,
@@ -337,6 +378,7 @@ def main() -> None:
         spot_meta=spot_meta,
         output_png=out_path,
     )
+    print(f"Saved figure: {out_path}")
 
 
 if __name__ == "__main__":
