@@ -1,0 +1,54 @@
+project:
+  name: hartmann_sensor_sim
+  version: 0.1
+  description: Baseline config for full optical simulation + detection pipeline.
+
+units:
+  length: m
+  wavelength: m
+  intensity: a.u.
+
+source:
+  model: plane_wave
+  wavelength_m: 5.5e-7
+  intensity_au: 1.0
+  beam_profile: uniform
+  beam_diameter_m: 1.0e-2
+
+microlens_array:
+  active_area_m: [1.0e-2, 1.0e-2]
+  pitch_m: 3.0e-4
+  layout: square
+  fill_factor: 1.0
+  lenslet_focal_length_m: null
+  computed:
+    lenslet_count_x: 33
+    lenslet_count_y: 33
+    used_area_m: [9.9e-3, 9.9e-3]
+    edge_margin_m: [5.0e-5, 5.0e-5]
+
+cmos:
+  active_area_m: [1.0e-2, 1.0e-2]
+  match_microlens_area: true
+  pixel_pitch_m: null
+  quantum_efficiency: null
+  read_noise_e: null
+  full_well_e: null
+
+propagation:
+  method: fresnel
+  distance_lenslet_to_cmos_m: null
+  grid_size: 1024
+  oversampling: 2
+
+detection:
+  method: centroid
+  threshold_relative: 0.2
+  background_subtraction: true
+
+reconstruction:
+  algorithm: zernike_least_squares
+  n_zernike: 15
+
+runtime:
+  random_seed: 42
