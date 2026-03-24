@@ -6,8 +6,8 @@ Part 1:
 - Build a wavefront phase map on the configured grid.
 
 Part 2:
-- Use local wavefront slopes per lenslet to synthesize focal-spot shifts.
-- Render a Shack-Hartmann-like spot image on the configured grid.
+- Use per-lenslet Fraunhofer propagation (FFT) to synthesize SH spots.
+- Render a Shack-Hartmann-like image on the configured grid.
 
 All physical sizes are interpreted in meters.
 """
@@ -15,7 +15,7 @@ All physical sizes are interpreted in meters.
 from __future__ import annotations
 
 import argparse
-from math import comb, floor, sqrt
+from math import comb, sqrt
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -110,7 +110,7 @@ def build_wavefront_phase(
     if n_modes < 1:
         raise ValueError("wavefront_random.n_modes must be >= 1")
 
-    coeff_std_waves = float(wf_rand.get("coeff_std_waves", 0.08))
+    coeff_std_waves = float(wf_rand.get("coeff_std_waves", 1.0))
     effective_coeff_std_waves = coeff_std_waves * float(coeff_scale)
 
     rng = np.random.default_rng(seed)
@@ -131,6 +131,15 @@ def build_wavefront_phase(
     return phase_rad, opd_m, pupil_mask, xx, coeff_map
 
 
+def downsample_block_mean(image: np.ndarray, factor: int) -> np.ndarray:
+    if factor == 1:
+        return image
+    h, w = image.shape
+    if h % factor != 0 or w % factor != 0:
+        raise ValueError("downsample factor must divide both image dimensions")
+    return image.reshape(h // factor, factor, w // factor, factor).mean(axis=(1, 3))
+
+
 def simulate_sh_image(
     cfg: Dict,
     opd_m: np.ndarray,
@@ -148,8 +157,6 @@ def simulate_sh_image(
 
     nx = int(grid["nx"])
     ny = int(grid["ny"])
-    dx = float(grid["dx_m"])
-    dy = float(grid["dy_m"])
     s = int(grid["samples_per_lenslet"])
 
     lenslet_count_x = int(mla["computed"]["lenslet_count_x"])
@@ -160,29 +167,19 @@ def simulate_sh_image(
             "Grid is not lenslet-aligned: nx/ny must equal lenslet_count * samples_per_lenslet."
         )
 
-    f = mla.get("lenslet_focal_length_m", None)
-    if f is None:
-        f = prop.get("distance_lenslet_to_cmos_m", None)
-    if f is None:
-        # Default assumption for a "typical" lenslet when config leaves it empty.
-        f = 1.0e-2
-    focal_length_m = float(f)
+    oversampling = int(max(1, prop.get("oversampling", 1)))
+    n_fft = s * oversampling
 
-    pitch_m = float(mla["pitch_m"])
-    fill_factor = float(mla.get("fill_factor", 1.0))
-    clear_aperture_m = pitch_m * np.sqrt(max(fill_factor, 1e-9))
-
-    airy_radius_m = 1.22 * wavelength_m * focal_length_m / clear_aperture_m
-    sigma_m = airy_radius_m / 2.355
-    sigma_px = max(sigma_m / dx, 0.8)
-
-    d_w_dy, d_w_dx = np.gradient(opd_m, dy, dx)
-
+    two_pi_over_lambda = 2.0 * np.pi / wavelength_m
     image = np.zeros((ny, nx), dtype=np.float32)
 
-    max_shift_px = 0.0
     mean_shift_acc = 0.0
+    max_shift_px = 0.0
     shift_count = 0
+
+    local_coords = np.arange(s, dtype=np.float64)
+    gx_local, gy_local = np.meshgrid(local_coords, local_coords)
+    center_ref = 0.5 * (s - 1)
 
     for ly in range(lenslet_count_y):
         y0 = ly * s
@@ -192,55 +189,45 @@ def simulate_sh_image(
             x1 = (lx + 1) * s
 
             patch_mask = pupil_mask[y0:y1, x0:x1]
-            illum = float(np.mean(patch_mask))
-            if illum <= max(1e-6, min_lenslet_fill):
+            fill = float(np.mean(patch_mask))
+            if fill <= max(1e-6, min_lenslet_fill):
                 continue
 
-            sx = float(np.mean(d_w_dx[y0:y1, x0:x1][patch_mask]))
-            sy = float(np.mean(d_w_dy[y0:y1, x0:x1][patch_mask]))
+            patch_opd = opd_m[y0:y1, x0:x1]
+            patch_phase = two_pi_over_lambda * patch_opd
 
-            shift_x_px = (focal_length_m * sx) / dx
-            shift_y_px = (focal_length_m * sy) / dy
+            # Lenslet pupil field: unit amplitude inside illuminated subaperture,
+            # aberration encoded in phase.
+            field = patch_mask.astype(np.float64) * np.exp(1j * patch_phase)
 
-            shift_mag_px = float(np.hypot(shift_x_px, shift_y_px))
-            max_shift_px = max(max_shift_px, shift_mag_px)
-            mean_shift_acc += shift_mag_px
+            # Fraunhofer pattern at lenslet focal plane (FFT model).
+            fft_field = np.fft.fftshift(np.fft.fft2(field, s=(n_fft, n_fft)))
+            psf = np.abs(fft_field) ** 2
+
+            # Return to configured per-lenslet detector sampling.
+            psf = downsample_block_mean(psf, oversampling)
+
+            psf_sum = float(np.sum(psf)) + 1e-12
+            psf = psf / psf_sum
+
+            # Centroid shift statistics (relative to lenslet-cell center).
+            cx = float(np.sum(psf * gx_local))
+            cy = float(np.sum(psf * gy_local))
+            shift_mag = float(np.hypot(cx - center_ref, cy - center_ref))
+            mean_shift_acc += shift_mag
+            max_shift_px = max(max_shift_px, shift_mag)
             shift_count += 1
 
-            cx = x0 + 0.5 * (s - 1) + shift_x_px
-            cy = y0 + 0.5 * (s - 1) + shift_y_px
-
-            r = int(floor(4.0 * sigma_px)) + 1
-            x_min = max(0, int(floor(cx)) - r)
-            x_max = min(nx - 1, int(floor(cx)) + r)
-            y_min = max(0, int(floor(cy)) - r)
-            y_max = min(ny - 1, int(floor(cy)) + r)
-
-            # Spot center may be outside sensor for large aberrations.
-            # If clipped window has no overlap with sensor, skip this spot.
-            if x_min > x_max or y_min > y_max:
-                continue
-
-            xx = np.arange(x_min, x_max + 1, dtype=np.float64)
-            yy = np.arange(y_min, y_max + 1, dtype=np.float64)
-            gx, gy = np.meshgrid(xx, yy)
-
-            spot = np.exp(-((gx - cx) ** 2 + (gy - cy) ** 2) / (2.0 * sigma_px**2))
-            spot_sum = float(np.sum(spot)) + 1e-12
-            spot = spot / spot_sum
-
-            image[y_min:y_max + 1, x_min:x_max + 1] += (
-                source_intensity * illum * spot
-            ).astype(np.float32)
+            image[y0:y1, x0:x1] += (source_intensity * fill * psf).astype(np.float32)
 
     mean_shift_px = mean_shift_acc / shift_count if shift_count > 0 else 0.0
 
     meta = {
-        "focal_length_m": focal_length_m,
-        "sigma_px": float(sigma_px),
-        "airy_radius_m": float(airy_radius_m),
-        "max_shift_px": float(max_shift_px),
+        "model": "lenslet_fft",
+        "oversampling": float(oversampling),
+        "n_fft": float(n_fft),
         "mean_shift_px": float(mean_shift_px),
+        "max_shift_px": float(max_shift_px),
         "shift_count": float(shift_count),
     }
     return image, meta
@@ -282,33 +269,14 @@ def plot_results(
         cmap="inferno",
         extent=extent,
     )
-    pitch = float(mla["pitch_m"])
-    lenslet_count_x = int(mla["computed"]["lenslet_count_x"])
-    lenslet_count_y = int(mla["computed"]["lenslet_count_y"])
-    x_centers = -used_w / 2.0 + (np.arange(lenslet_count_x) + 0.5) * pitch
-    y_centers = -used_h / 2.0 + (np.arange(lenslet_count_y) + 0.5) * pitch
-    cx, cy = np.meshgrid(x_centers, y_centers)
-
-    axes[1].scatter(
-        cx.ravel(),
-        cy.ravel(),
-        s=6,
-        c="cyan",
-        marker="+",
-        linewidths=0.35,
-        alpha=0.85,
-        label="Lenslet centers",
-    )
-    axes[1].set_title("Simulated Shack-Hartmann Image")
+    axes[1].set_title("Simulated Shack-Hartmann Image (Lenslet FFT)")
     axes[1].set_xlabel("x (m)")
     axes[1].set_ylabel("y (m)")
-    axes[1].legend(loc="upper right", fontsize=7, framealpha=0.75)
     fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
     coeff_text = ", ".join([f"{k}={v:.3e} m" for k, v in coeff_map.items()])
     meta_text = (
-        f"f={spot_meta['focal_length_m']:.3e} m, "
-        f"spot_sigma={spot_meta['sigma_px']:.2f} px, "
+        f"model={spot_meta['model']}, n_fft={int(spot_meta['n_fft'])}, "
         f"mean_shift={spot_meta['mean_shift_px']:.2f} px, "
         f"max_shift={spot_meta['max_shift_px']:.2f} px"
     )
@@ -355,6 +323,7 @@ def main() -> None:
     sh_image, spot_meta = simulate_sh_image(cfg, opd_m=opd_m, pupil_mask=pupil_mask)
 
     print(f"Zernike coeff scale: {float(args.coeff_scale):.3f}")
+    print(f"Model: {spot_meta['model']}")
     print(f"Mean spot shift: {spot_meta['mean_shift_px']:.3f} px")
     print(f"Max spot shift: {spot_meta['max_shift_px']:.3f} px")
 
@@ -370,5 +339,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
